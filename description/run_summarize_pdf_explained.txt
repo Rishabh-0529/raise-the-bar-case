@@ -1,0 +1,251 @@
+run_summarize_pdf.py — line-by-line explanation
+
+This document explains every line (and small blocks) in the file `run_summarize_pdf.py` located in the project root. The explanations aim to be explicit and clear for someone learning the code.
+
+Note: line numbers below are for reference and not part of the file. If you copy/paste, they will not be included.
+
+1  from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoConfig, logging
+   - Imports four names from the Hugging Face `transformers` library:
+     * `AutoTokenizer`: a helper that loads the correct tokenizer class for a model name.
+     * `AutoModelForSeq2SeqLM`: automatically selects the Seq2Seq model class (encoder-decoder) for the provided model.
+     * `AutoConfig`: loads model configuration which can be modified before model creation.
+     * `logging`: module helper to control the transformers library logging level.
+
+2  from PyPDF2 import PdfReader
+   - Imports `PdfReader` from the PyPDF2 library. `PdfReader` is used to read and extract text from PDF files.
+
+3  from PyPDF2.errors import PdfReadError
+   - Imports `PdfReadError`, a specific exception PyPDF2 raises when encountering PDF read problems (for example, when the PDF is truncated or malformed).
+
+4  import torch
+   - Imports PyTorch, which is used as the backend for the model tensors and device management.
+
+5  from pathlib import Path
+   - Imports `Path` from the standard library `pathlib` module, a convenient object-oriented way to handle filesystem paths.
+
+6  import re
+   - Imports the `re` module for regular expression operations used in text cleaning.
+
+7  
+8  # Configuration
+9  model_name = "google/flan-t5-small"
+   - Sets the variable `model_name` to the pre-trained model identifier used by Hugging Face Hub. This string is passed into the tokenizer and model loaders.
+
+10 
+11 # load config and request untied embeddings
+12 config = AutoConfig.from_pretrained(model_name)
+    - Loads the model configuration from the model repository identified by `model_name`.
+    - This gives programmatic access to the model's configuration before instantiation.
+
+13 # Use default (tied) embeddings to match pretrained checkpoint behavior.
+14 # Setting untied embeddings can leave lm_head or decoder embeddings mismatched
+15 # which may produce degraded or repetitive outputs unless carefully handled.
+16 config.tie_word_embeddings = True
+    - Ensures the model will tie the input token embeddings and output (lm_head) weights.
+    - Tied embeddings are the default for many T5-style checkpoints; using `True` avoids parameter mismatch and helps generate correct output.
+
+17 
+18 # reduce logging noise
+19 logging.set_verbosity_error()
+    - Sets the transformers library logging verbosity to the "error" level to suppress informational and warning messages. This keeps terminal output cleaner.
+
+20 
+21 
+22 def _copy_shared_embeddings(model):
+23     shared = getattr(model, "shared", None)
+24     if shared is None:
+25         return
+26     enc = getattr(model, "encoder", None)
+27     if enc is not None and hasattr(enc, "embed_tokens"):
+28         try:
+29             if enc.embed_tokens.weight.shape == shared.weight.shape:
+30                 enc.embed_tokens.weight.data.copy_(shared.weight.data)
+31         except Exception:
+32             pass
+33     dec = getattr(model, "decoder", None)
+34     if dec is not None and hasattr(dec, "embed_tokens"):
+35         try:
+36             if dec.embed_tokens.weight.shape == shared.weight.shape:
+37                 dec.embed_tokens.weight.data.copy_(shared.weight.data)
+38         except Exception:
+39             pass
+40     lm = getattr(model, "lm_head", None)
+41     if lm is not None:
+42         try:
+43             if lm.weight.shape == shared.weight.shape:
+44                 lm.weight.data.copy_(shared.weight.data)
+45         except Exception:
+46             pass
+
+   - `_copy_shared_embeddings` is a helper that copies weights from a shared embedding matrix (often used by T5 check points) into encoder/decoder / lm_head when embeddings are untied or when those parameters might otherwise be randomly initialized.
+   - Lines 23-25: obtain `model.shared` (the shared embedding) or return early if missing.
+   - Lines 26-32: if the model has an encoder with `embed_tokens`, and the shapes match, copy the weights from shared into encoder's embed tokens.
+   - Lines 33-39: same for decoder's `embed_tokens`.
+   - Lines 40-46: same for `lm_head` if present. The `try/except` blocks make the function robust to unexpected architectures.
+   - In this repo we typically keep embeddings tied (config.tie_word_embeddings = True), but the helper is useful if the code experimented with untied embeddings.
+
+47 
+48 # Load tokenizer and model
+49 tokenizer = AutoTokenizer.from_pretrained(model_name)
+    - Loads the tokenizer appropriate for `model_name`. Tokenizer handles converting text to token ids and back.
+
+50 model = AutoModelForSeq2SeqLM.from_pretrained(model_name, config=config)
+    - Loads the pre-trained seq2seq model weights from the Hub using `model_name` and the `config` we prepared.
+
+51 _copy_shared_embeddings(model)
+    - Calls the helper to copy shared weights if necessary. With tied embeddings this is effectively a no-op but is safe to run.
+
+52 
+53 # device
+54 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    - Determines whether a CUDA GPU is available and builds a `device` object accordingly. If not available, it uses CPU.
+
+55 model.to(device)
+    - Moves the model's parameters to the selected PyTorch device (GPU or CPU) so generation and inference run there.
+
+56 
+57 
+58 def clean_text(text: str) -> str:
+59     if not text:
+60         return text
+61     lines = text.replace('\r', '').split('\n')
+62     kept = []
+63     for line in lines:
+64         s = line.strip()
+65         if not s:
+66             continue
+67         if re.match(r'^(STORIES YOU MAY LIKE|ADVERTISEMENT)$', s, flags=re.I):
+68             continue
+69         if len(s) < 200 and s.isupper():
+70             continue
+71         if s.startswith('Video:'):
+72             continue
+73         kept.append(s)
+74     cleaned = ' '.join(kept)
+75     cleaned = re.sub(r'\s+', ' ', cleaned)
+76     cleaned = re.sub(r'([!?.,]){2,}', r"\\1", cleaned)
+77     return cleaned.strip()
+
+   - `clean_text` is a utility that sanitizes raw article text before sending it to the model.
+   - Line 61: normalizes Windows CR characters and splits on newlines.
+   - Lines 63-73: iterate lines, strip whitespace, and drop empty/boilerplate lines:
+     * Drops the markers like "STORIES YOU MAY LIKE" and "ADVERTISEMENT" (case-insensitive).
+     * Drops short ALL-CAPS lines (commonly section headers) which typically don't add to summary.
+     * Drops lines starting with "Video:" (UI artifacts).
+   - Lines 74-76: join kept lines into a single paragraph, collapse repeated whitespace, and normalize repeated punctuation. The `re.sub` uses a backreference pattern to keep single punctuation in place of runs such as '!!!' or '...'.
+   - Line 77: final strip and return.
+
+78 
+79 
+80 def extract_text_from_pdf(path: Path) -> str:
+81     try:
+82         reader = PdfReader(str(path), strict=False)
+83         pages = []
+84         for p in reader.pages:
+85             try:
+86                 pages.append(p.extract_text() or "")
+87             except Exception:
+88                 pages.append("")
+89         text = "\n".join(pages).strip()
+90         return clean_text(text)
+91     except PdfReadError as e:
+92         print("PdfReadError while reading", path.name, ":", e)
+93         return ""
+94     except Exception as e:
+95         print("Error reading", path.name, ":", e)
+96         return ""
+
+   - `extract_text_from_pdf` attempts to extract textual content from a PDF file.
+   - Line 82: instantiates `PdfReader` with `strict=False` to be forgiving of minor PDF formatting problems. `str(path)` converts Path to a filesystem string.
+   - Lines 83-88: iterate pages and call `extract_text()` (some pages may fail, those are caught and replaced with empty strings so extraction continues).
+   - Line 89: join page texts with newlines and strip surrounding whitespace.
+   - Line 90: returns cleaned text using the `clean_text` function.
+   - Lines 91-96: if PyPDF2 raises `PdfReadError` (e.g., truncated PDF) or any other exception, print an informative message and return an empty string to signal failure.
+
+97 
+98 
+99 def summarize_text(text, max_input_length=1024, max_output_length=150):
+100     prompt = f"Summarize the following text:\n{text}"
+101     inputs = tokenizer(
+102         prompt,
+103         max_length=max_input_length,
+104         truncation=True,
+105         return_tensors="pt"
+106     )
+107     inputs = {k: v.to(device) for k, v in inputs.items()}
+108     # Improved generation settings to reduce repetition and verbosity
+109     summary_ids = model.generate(
+110         inputs["input_ids"],
+111         attention_mask=inputs.get("attention_mask", None),
+112         max_length=max_output_length,
+113         min_length=20,
+114         length_penalty=1.0,
+115         num_beams=4,
+116         no_repeat_ngram_size=3,
+117         repetition_penalty=1.2,
+118         temperature=0.7,
+119         early_stopping=True
+120     )
+121     summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+122     return summary
+
+   - `summarize_text` prepares a prompt, tokenizes, runs the model's generation API, decodes and returns a text summary.
+   - Lines 101-106: tokenizer encodes the prompt, truncates to `max_input_length`, and returns PyTorch tensors (shape [batch, seq_len]).
+   - Line 107: moves the input tensors to the same device as the model.
+   - Lines 109-120: call `model.generate()` with generation hyperparameters:
+     * `max_length`: maximum tokens to generate.
+     * `min_length`: minimum tokens to generate (set to 20 to avoid too-short outputs).
+     * `num_beams`: beam search width for more coherent output.
+     * `no_repeat_ngram_size=3`: prohibits repeating 3-grams to reduce repetition.
+     * `repetition_penalty=1.2`: discourages token repetition.
+     * `temperature=0.7`: lowers randomness to favor higher-probability tokens.
+     * `early_stopping=True`: stops beams when all finished.
+   - Line 121: decodes the highest-probability generated token ids into string, skipping special tokens (like <pad>, <eos>).
+
+123 
+124 
+125 if __name__ == "__main__":
+126     # Use a workspace-relative path to avoid Python unicode-escape issues with backslashes
+127     pdf_path = Path("pdf1.pdf")
+128     text = ""
+129     if pdf_path.exists():
+130         text = extract_text_from_pdf(pdf_path)
+131         if not text:
+132             print("Failed to extract text from pdf1.pdf or text empty; falling back to pdf1.txt")
+133     if not text:
+134         txt = Path("pdf1.txt")
+135         if txt.exists():
+136             text = txt.read_text(encoding='utf-8')
+137             print("Using pdf1.txt as fallback")
+138         else:
+139             print("No pdf1.pdf or pdf1.txt available. Exiting.")
+140             raise SystemExit(1)
+141     cleaned = clean_text(text)
+142     print("Cleaned input:\n", cleaned[:1000], "\n---\n")
+143     summary = summarize_text(cleaned)
+144     print("\nSUMMARY:\n", summary)
+
+   - Lines 125-126: standard Python main guard ensures the code below runs only when the file is executed directly (not when imported as a module).
+   - Line 127: create a `Path` object for the local file `pdf1.pdf`. Using a relative path avoids accidental `\U` escape sequences inside strings on Windows.
+   - Lines 128-132: if the file exists, try extracting text. If extraction fails or returns empty, a fallback message is printed.
+   - Lines 133-140: fallback logic — check for `pdf1.txt` (a plain text fallback), read it if present, or exit with a helpful error if neither source is available.
+   - Line 141: cleans the chosen text again for safety.
+   - Line 142: prints a preview (first 1000 characters) of the cleaned input to the console to aid debugging.
+   - Line 143: call `summarize_text` to generate the summary.
+   - Line 144: print the final summary.
+
+
+Notes, considerations, and suggestions
+-----------------------------------
+- Tokenization/truncation: the tokenizer truncates at `max_input_length` (default 1024). For very long documents, `summarize_long_text` + chunking (not present in this file) is recommended.
+- Reproducibility: if you want reproducible outputs, consider seeding Python, PyTorch, and transformers RNGs.
+- Performance: model.load and first generation may download weights and take time; a GPU accelerates inference if available.
+- Robustness: `extract_text_from_pdf` uses non-strict PDF parsing and is tolerant of some page-level failures.
+- Security: avoid committing HF tokens to source. Use environment variables or Hugging Face CLI for authentication.
+
+If you want, I can also:
+- Produce a version of this file with inline comments next to each line.
+- Create a separate README that documents how to run the script with examples.
+- Add a `--file` CLI argument so you can pass an arbitrary PDF path safely from the command line.
+
+File saved to: `run_summarize_pdf_explained.txt` in the workspace.
